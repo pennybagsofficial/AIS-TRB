@@ -46,6 +46,8 @@ TARGET_CHANNEL = os.environ["TARGET_CHANNEL"]       # Farsi:   @user or -100xxxx
 # The Farsi channel id + signature that must appear at the END of every post.
 FOOTER = os.environ.get("FOOTER", "@RadioBulletin | رادیو بولتن")
 TARGET_HANDLE = os.environ.get("TARGET_HANDLE", "@RadioBulletin")
+# Prepended to a post that doesn't already start with an emoji.
+LEAD_EMOJI = os.environ.get("LEAD_EMOJI", "🔹")
 # The English channel's @username (without @). Used to scrub it from the text so
 # the English id never leaks into the Farsi channel. Optional but recommended.
 SOURCE_USERNAME = os.environ.get("SOURCE_USERNAME", "").lstrip("@").lower()
@@ -223,6 +225,31 @@ def _scrub_source(s: str) -> str:
     return s
 
 
+# Covers 🔹 (U+1F537) and the common emoji/pictograph/symbol/flag blocks.
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"   # pictographs, emoticons, transport, extended-A
+    "\U00002600-\U000027BF"   # misc symbols + dingbats
+    "\U0001F1E6-\U0001F1FF"   # regional indicators (flags)
+    "\U00002B00-\U00002BFF"   # misc symbols & arrows (★ ⬛ …)
+    "\U00002190-\U000021FF"   # arrows
+    "]"
+)
+
+
+def _starts_with_emoji(text: str) -> bool:
+    plain = re.sub(r"<[^>]+>", "", text or "")                 # ignore leading HTML tags
+    plain = plain.lstrip(" \t\r\n\u200c\u200e\u200f\ufeff")    # and whitespace/zero-width
+    return bool(plain) and bool(_EMOJI_RE.match(plain))
+
+
+def _ensure_lead_emoji(body: str) -> str:
+    """Prepend the default emoji if the post doesn't already start with one."""
+    if body and not _starts_with_emoji(body):
+        return f"{LEAD_EMOJI} {body}"
+    return body
+
+
 def build_caption(html_text: str, plain_text: str) -> str:
     """Return an HTML caption (used with parse_mode=html): the translated body
     with the SAME formatting as the source (bold/italic/quote/links), followed by
@@ -232,7 +259,7 @@ def build_caption(html_text: str, plain_text: str) -> str:
     # Preferred path: AI model chain (keeps HTML formatting; switches model on limit).
     if TRANSLATOR == "github" and GH_TOKEN and html_text.strip():
         try:
-            fa = _scrub_source(_translate_github_chain(html_text)).strip()
+            fa = _ensure_lead_emoji(_scrub_source(_translate_github_chain(html_text)).strip())
             return f"{fa}\n\n{bold_footer}" if fa else bold_footer
         except Exception as e:
             log.warning("All AI models unavailable (%s). Falling back to Google.", e)
@@ -246,7 +273,7 @@ def build_caption(html_text: str, plain_text: str) -> str:
     except Exception as e:
         log.error("All translators failed (%s). Posting original text.", e)
         fa = src
-    fa = _scrub_source(html_lib.escape(fa)).strip()   # escape so plain text is valid HTML
+    fa = _ensure_lead_emoji(_scrub_source(html_lib.escape(fa)).strip())   # escape so plain text is valid HTML
     return f"{fa}\n\n{bold_footer}" if fa else bold_footer
 
 
