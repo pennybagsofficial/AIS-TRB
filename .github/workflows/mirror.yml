@@ -42,11 +42,14 @@ jobs:
           TARGET_HANDLE: "@RadioBulletin"
           FOOTER: "@RadioBulletin | رادیو بولتن"
           TRANSLATOR: "github"
-          MODEL: "openai/gpt-4.1"          # best Persian quality on GitHub Models
+          # AI model fallback chain (best Persian first). If one hits its limit,
+          # the bot switches to the next; Google is only the last resort.
+          MODELS: "openai/gpt-4.1,openai/gpt-4o,openai/gpt-4.1-mini,openai/gpt-4o-mini"
+          RUN_BUDGET: "600"               # 10 min cap per run (keep BELOW your trigger interval)
           # Watermark: set the variable WATERMARK=on and add watermark/logo.png to enable.
           WATERMARK: ${{ vars.WATERMARK }}
           LOGO_PATH: "watermark/logo.png"
-          WM_POSITION: "bottom-right"
+          WM_POSITION: "center"
           WM_SCALE: "0.18"
           WM_OPACITY: "0.85"
           # Either a fine-grained PAT with `models: read` as GH_MODELS_TOKEN,
