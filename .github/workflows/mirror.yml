@@ -1,0 +1,63 @@
+name: mirror
+
+on:
+  workflow_dispatch:       # triggered by cron-job.org (and the manual "Run" button)
+  schedule:
+    - cron: "*/30 * * * *" # backup only, in case cron-job.org misses a beat
+
+# Needed so the job can push the updated state file, and read GitHub Models.
+permissions:
+  contents: write
+  models: read
+
+# Never let two runs overlap.
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ffmpeg is preinstalled on ubuntu-latest; this guarantees it for video watermarking.
+      - name: Ensure ffmpeg
+        run: ffmpeg -version >/dev/null 2>&1 || sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - run: pip install -r requirements.txt
+
+      - name: Run mirror bot
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          SOURCE_CHANNEL: ${{ vars.SOURCE_CHANNEL }}
+          TARGET_CHANNEL: ${{ vars.TARGET_CHANNEL }}
+          SOURCE_USERNAME: ${{ vars.SOURCE_USERNAME }}
+          TARGET_HANDLE: "@RadioBulletin"
+          FOOTER: "@RadioBulletin | رادیو بولتن"
+          TRANSLATOR: "github"
+          MODEL: "openai/gpt-4.1"          # best Persian quality on GitHub Models
+          # Watermark: set the variable WATERMARK=on and add watermark/logo.png to enable.
+          WATERMARK: ${{ vars.WATERMARK }}
+          LOGO_PATH: "watermark/logo.png"
+          WM_POSITION: "bottom-right"
+          WM_SCALE: "0.18"
+          WM_OPACITY: "0.85"
+          # Either a fine-grained PAT with `models: read` as GH_MODELS_TOKEN,
+          # or rely on the built-in token (works thanks to `models: read` above).
+          GH_MODELS_TOKEN: ${{ secrets.GH_MODELS_TOKEN || secrets.GITHUB_TOKEN }}
+        run: python bot.py
+
+      - name: Save progress
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A state || true
+          git diff --cached --quiet || git commit -m "update state [skip ci]"
+          git push
