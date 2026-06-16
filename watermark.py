@@ -39,6 +39,8 @@ def available() -> bool:
 
 def _xy(base_w, base_h, logo_w, logo_h):
     m = MARGIN
+    if POSITION == "center":
+        return (base_w - logo_w) // 2, (base_h - logo_h) // 2
     if POSITION == "top-left":
         return m, m
     if POSITION == "top-right":
@@ -73,6 +75,7 @@ def _wm_image(in_path: str) -> str:
 def _wm_video(in_path: str) -> str:
     out = in_path + ".wm.mp4"
     overlay = {
+        "center": "(W-w)/2:(H-h)/2",
         "top-left": f"{MARGIN}:{MARGIN}",
         "top-right": f"W-w-{MARGIN}:{MARGIN}",
         "bottom-left": f"{MARGIN}:H-h-{MARGIN}",
