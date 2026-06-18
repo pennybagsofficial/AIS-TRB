@@ -18,6 +18,7 @@ concurrency:
 jobs:
   mirror:
     runs-on: ubuntu-latest
+    timeout-minutes: 20   # hard ceiling so a run can never hang for hours and jam the queue
     steps:
       - uses: actions/checkout@v4
 
@@ -32,9 +33,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      # ffmpeg is preinstalled on ubuntu-latest; this guarantees it for video watermarking.
+      # ffmpeg is preinstalled on ubuntu-latest. Only touch apt if it's genuinely
+      # missing (the old one-liner always ran apt-get and could hang for hours).
       - name: Ensure ffmpeg
-        run: ffmpeg -version >/dev/null 2>&1 || sudo apt-get update && sudo apt-get install -y ffmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y ffmpeg
+          else
+            echo "ffmpeg already present: $(ffmpeg -version | head -1)"
+          fi
 
       - run: pip install -r requirements.txt
 
