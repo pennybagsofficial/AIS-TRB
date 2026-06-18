@@ -27,6 +27,7 @@ import tempfile
 import pathlib
 import urllib.request
 import urllib.error
+from datetime import datetime
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -52,19 +53,48 @@ LEAD_EMOJI = os.environ.get("LEAD_EMOJI", "🔹")
 # the English id never leaks into the Farsi channel. Optional but recommended.
 SOURCE_USERNAME = os.environ.get("SOURCE_USERNAME", "").lstrip("@").lower()
 
+# Per-post analytics report channel (set to "" to disable). The bot account must
+# be able to post there.
+LOG_CHANNEL = os.environ.get("LOG_CHANNEL", "@AnalyzeAistrb")
+REPORT_TZ = os.environ.get("REPORT_TZ", "Asia/Tehran")
+
 TRANSLATOR = os.environ.get("TRANSLATOR", "github").lower()   # github | google
 GH_TOKEN = os.environ.get("GH_MODELS_TOKEN", "")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# AI model fallback chain: best Persian first, then higher-limit models. If one
-# hits its rate limit, the bot switches to the next (all keep HTML formatting).
-# Google is the very last resort (plain text only).
-MODELS = [m.strip() for m in os.environ.get(
-    "MODELS",
-    "openai/gpt-4.1,openai/gpt-4o,openai/gpt-4.1-mini,openai/gpt-4o-mini"
-).split(",") if m.strip()]
-_PRIMARY = os.environ.get("MODEL", "").strip()   # optional override for the first model
-if _PRIMARY and _PRIMARY not in MODELS:
-    MODELS.insert(0, _PRIMARY)
+# Translation fallback chain, BEST Persian first. Each entry is "backend:model".
+# Backends:
+#   github : GitHub Models (needs GH_MODELS_TOKEN)   -> keeps HTML formatting
+#   gemini : Google Gemini (needs GEMINI_API_KEY)    -> keeps HTML formatting, big daily quota
+#   google : free Google Translate (no key)          -> plain text only, final safety net
+# When a model hits its limit the bot moves to the next one. Edit freely; if a
+# model id is wrong/retired the bot just skips it. Non-OpenAI ids can be copied
+# from https://github.com/marketplace/models
+_DEFAULT_CHAIN = (
+    "github:openai/gpt-4.1,"
+    "github:openai/gpt-4o,"
+    "gemini:gemini-2.5-flash,"
+    "github:openai/gpt-4.1-mini,"
+    "github:openai/gpt-4o-mini,"
+    "github:deepseek/DeepSeek-V3-0324,"
+    "github:meta/Llama-3.3-70B-Instruct,"
+    "github:mistral-ai/Mistral-Large-2411,"
+    "google:translate"
+)
+
+
+def _parse_chain(s: str):
+    chain = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        backend, _, model = part.partition(":")
+        chain.append({"name": part, "backend": backend.strip().lower(), "model": model.strip()})
+    return chain
+
+
+CHAIN = _parse_chain(os.environ.get("CHAIN", _DEFAULT_CHAIN))
 
 # When a model is rate-limited we remember it (across runs) so we don't keep
 # wasting a doomed request on it for every post.
@@ -108,6 +138,21 @@ def _strip_fences(s: str) -> str:
     return s
 
 
+def _looks_persian(text: str) -> bool:
+    """True if the (tag-stripped) text is meaningfully Persian. Used to reject a
+    model that ignored the instruction and echoed the English text back."""
+    plain = re.sub(r"<[^>]+>", "", text or "")
+    letters = [c for c in plain if c.isalpha()]
+    if not letters:
+        return True  # only emoji/numbers/punctuation -> nothing to translate
+    persian = sum(
+        1 for c in letters
+        if "\u0600" <= c <= "\u06FF" or "\u0750" <= c <= "\u077F"
+        or "\uFB50" <= c <= "\uFDFF" or "\uFE70" <= c <= "\uFEFF"
+    )
+    return persian / len(letters) >= 0.3
+
+
 # --- model cooldowns (persisted across runs in state/model_cooldowns.json) --- #
 def _load_cooldowns() -> dict:
     try:
@@ -136,8 +181,8 @@ def _retry_after(e) -> int:
         return 0
 
 
-def _post_github(model: str, text: str) -> str:
-    """One inference call to a single model. Raises on failure."""
+def _chat_completion(url: str, headers: dict, model: str, text: str) -> str:
+    """One OpenAI-compatible chat call (works for both GitHub Models and Gemini)."""
     body = json.dumps({
         "model": model,
         "temperature": 0.4,
@@ -147,56 +192,83 @@ def _post_github(model: str, text: str) -> str:
         ],
     }).encode("utf-8")
     req = urllib.request.Request(
-        "https://models.github.ai/inference/chat/completions",
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {GH_TOKEN}",
-            "Content-Type": "application/json",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2026-03-10",
-        },
+        url, data=body, method="POST",
+        headers={**headers, "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=90) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return _strip_fences(data["choices"][0]["message"]["content"])
 
 
-def _translate_github_chain(text: str) -> str:
-    """Try each model in order, skipping any still on cooldown. Returns the
-    translated HTML, or raises RuntimeError if no model is available right now."""
+def _call_backend(entry: dict, html_text: str, plain_text: str):
+    """Dispatch to the right backend. Returns (text, is_html)."""
+    backend, model = entry["backend"], entry["model"]
+    if backend == "github":
+        return _chat_completion(
+            "https://models.github.ai/inference/chat/completions",
+            {"Authorization": f"Bearer {GH_TOKEN}",
+             "Accept": "application/vnd.github+json",
+             "X-GitHub-Api-Version": "2026-03-10"},
+            model, html_text), True
+    if backend == "gemini":
+        return _chat_completion(
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            {"Authorization": f"Bearer {GEMINI_KEY}"},
+            model, html_text), True
+    if backend == "google":
+        return _translate_google(plain_text), False
+    raise ValueError(f"unknown backend: {backend}")
+
+
+def _available(entry: dict) -> bool:
+    if entry["backend"] == "github":
+        return bool(GH_TOKEN)
+    if entry["backend"] == "gemini":
+        return bool(GEMINI_KEY)
+    return entry["backend"] == "google"   # always available (no key)
+
+
+def translate_chain(html_text: str, plain_text: str):
+    """Walk the chain best-first, skipping anything on cooldown or non-Persian.
+    Returns (translated_text, is_html, model_name). Raises if nothing worked."""
     now = time.time()
     last_err = None
-    for model in MODELS:
-        if _COOLDOWNS.get(model, 0) > now:
-            continue  # still cooling down from an earlier limit -> skip silently
+    for entry in CHAIN:
+        name = entry["name"]
+        if not _available(entry) or _COOLDOWNS.get(name, 0) > now:
+            continue
         try:
-            return _post_github(model, text)
+            text, is_html = _call_backend(entry, html_text, plain_text)
+            if not _looks_persian(text):
+                log.warning("%s returned non-Persian output; trying next.", name)
+                continue   # quality miss (not a rate limit) -> just try next, no cooldown
+            return text, is_html, name
         except urllib.error.HTTPError as e:
             last_err = e
             if e.code == 429:
                 wait = _retry_after(e)
-                # brief per-minute throttle: wait once (if short) and retry same model
-                if 0 < wait <= 20:
+                if 0 < wait <= 20:   # brief throttle: wait once and retry same backend
                     time.sleep(wait + 1)
                     try:
-                        return _post_github(model, text)
+                        text, is_html = _call_backend(entry, html_text, plain_text)
+                        if _looks_persian(text):
+                            return text, is_html, name
                     except Exception as e2:
                         last_err = e2
                 cd = min(wait or COOLDOWN_DEFAULT, COOLDOWN_MAX)
-                _COOLDOWNS[model] = now + cd
-                log.warning("Model %s rate-limited; cooling %ss, switching to next model.", model, cd)
+                _COOLDOWNS[name] = now + cd
+                log.warning("%s rate-limited; cooling %ss, switching to next.", name, cd)
             elif 400 <= e.code < 500:
-                _COOLDOWNS[model] = now + COOLDOWN_MAX   # bad/unavailable model id
-                log.warning("Model %s returned HTTP %s; disabling temporarily.", model, e.code)
-            else:                                        # 5xx: transient
-                _COOLDOWNS[model] = now + 60
-                log.warning("Model %s returned HTTP %s; brief cooldown.", model, e.code)
-        except Exception as e:                           # network / timeout
+                _COOLDOWNS[name] = now + COOLDOWN_MAX   # bad/retired model id
+                log.warning("%s returned HTTP %s; disabling temporarily.", name, e.code)
+            else:
+                _COOLDOWNS[name] = now + 60             # 5xx transient
+                log.warning("%s returned HTTP %s; brief cooldown.", name, e.code)
+        except Exception as e:
             last_err = e
-            _COOLDOWNS[model] = now + 60
-            log.warning("Model %s call failed (%s); brief cooldown.", model, e)
-    raise RuntimeError(f"all AI models unavailable ({last_err})")
+            _COOLDOWNS[name] = now + 60                 # network / timeout
+            log.warning("%s call failed (%s); brief cooldown.", name, e)
+    raise RuntimeError(f"all translators unavailable ({last_err})")
 
 
 def _translate_google(text: str) -> str:
@@ -250,31 +322,53 @@ def _ensure_lead_emoji(body: str) -> str:
     return body
 
 
-def build_caption(html_text: str, plain_text: str) -> str:
-    """Return an HTML caption (used with parse_mode=html): the translated body
-    with the SAME formatting as the source (bold/italic/quote/links), followed by
-    a BOLD footer that carries the Farsi channel id."""
+def build_caption(html_text: str, plain_text: str):
+    """Return (caption, model_used). Caption is HTML (parse_mode=html): translated
+    body with source formatting, a leading emoji, and a BOLD footer."""
     bold_footer = f"<b>{html_lib.escape(FOOTER)}</b>"
 
-    # Preferred path: AI model chain (keeps HTML formatting; switches model on limit).
-    if TRANSLATOR == "github" and GH_TOKEN and html_text.strip():
-        try:
-            fa = _ensure_lead_emoji(_scrub_source(_translate_github_chain(html_text)).strip())
-            return f"{fa}\n\n{bold_footer}" if fa else bold_footer
-        except Exception as e:
-            log.warning("All AI models unavailable (%s). Falling back to Google.", e)
+    if not html_text.strip() and not (plain_text or "").strip():
+        return bold_footer, None          # media-only post, no text
 
-    # Last resort: Google (plain text only; formatting can't be preserved here).
-    src = (plain_text or "").strip()
-    if not src:
-        return bold_footer
     try:
-        fa = _translate_google(src)
+        fa, is_html, model_used = translate_chain(html_text, plain_text)
+        if not is_html:                    # google plain text -> make it valid HTML
+            fa = html_lib.escape(fa)
     except Exception as e:
         log.error("All translators failed (%s). Posting original text.", e)
-        fa = src
-    fa = _ensure_lead_emoji(_scrub_source(html_lib.escape(fa)).strip())   # escape so plain text is valid HTML
-    return f"{fa}\n\n{bold_footer}" if fa else bold_footer
+        fa = html_lib.escape(plain_text or "")
+        model_used = "original (untranslated)"
+
+    fa = _ensure_lead_emoji(_scrub_source(fa).strip())
+    caption = f"{fa}\n\n{bold_footer}" if fa else bold_footer
+    return caption, model_used
+
+
+def _now_str() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(REPORT_TZ)).strftime("%Y-%m-%d %H:%M ") + REPORT_TZ
+    except Exception:
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+
+async def send_report(client, model_used, src_id, sent):
+    """Best-effort analytics report to LOG_CHANNEL. Never raises into the caller."""
+    if not LOG_CHANNEL:
+        return
+    msg = sent[0] if isinstance(sent, (list, tuple)) and sent else sent
+    handle = TARGET_HANDLE.lstrip("@")
+    link = ""
+    if msg is not None and handle and not handle.lstrip("-").isdigit():
+        link = f"https://t.me/{handle}/{getattr(msg, 'id', '')}"
+    lines = [
+        "📊 <b>گزارش انتشار</b>",
+        f"منبع: {html_lib.escape(str(SOURCE_CHANNEL))}",
+        f"مدل زبانی: <code>{html_lib.escape(model_used or '— (بدون ترجمه)')}</code>",
+        f"تاریخ و ساعت: {html_lib.escape(_now_str())}",
+        (f'<a href="{link}">مشاهده‌ی پست</a>' if link else f"شناسه‌ی پست مبدأ: {src_id}"),
+    ]
+    await client.send_message(LOG_CHANNEL, "\n".join(lines), link_preview=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -336,18 +430,17 @@ def media_kind(m) -> str:
 
 async def post_group(client, target, group, caption):
     """Post one post: a single message or an album, keeping ALL media.
-    If watermarking is enabled, every photo/video is stamped first."""
+    If watermarking is enabled, every photo/video is stamped first.
+    Returns the sent message (or list of messages for an album)."""
     media_msgs = [m for m in group if m.media]
     if not media_msgs:
-        await _send_text(client, target, caption)
-        return
+        return await _send_text(client, target, caption)
 
     # Fast path: no watermark -> re-use media already on Telegram servers.
     if not watermark.available():
         try:
             files = [m.media for m in media_msgs]
-            await _send_file(client, target, files if len(files) > 1 else files[0], caption)
-            return
+            return await _send_file(client, target, files if len(files) > 1 else files[0], caption)
         except Exception as e:
             log.warning("Direct media re-send failed (%s); downloading then re-uploading.", e)
 
@@ -362,9 +455,8 @@ async def post_group(client, target, group, caption):
                 p = watermark.apply(p, media_kind(m))
             paths.append(p)
         if not paths:
-            await _send_text(client, target, caption)
-            return
-        await _send_file(client, target, paths if len(paths) > 1 else paths[0], caption)
+            return await _send_text(client, target, caption)
+        return await _send_file(client, target, paths if len(paths) > 1 else paths[0], caption)
 
 
 # --------------------------------------------------------------------------- #
@@ -437,12 +529,17 @@ async def run():
             write_state(max(x.id for x in grp))
             continue
         try:
-            caption = build_caption(html_text, plain_text)
-            await post_group(client, tgt, grp, caption)
+            caption, model_used = build_caption(html_text, plain_text)
+            sent = await post_group(client, tgt, grp, caption)
             # checkpoint AFTER success -> nothing lost, nothing duplicated
-            write_state(max(x.id for x in grp))
-            log.info("Mirrored post id=%s (%d media).",
-                     max(x.id for x in grp), sum(1 for x in grp if x.media))
+            post_id = max(x.id for x in grp)
+            write_state(post_id)
+            log.info("Mirrored post id=%s (%d media) via %s.",
+                     post_id, sum(1 for x in grp if x.media), model_used or "—")
+            try:
+                await send_report(client, model_used, post_id, sent)
+            except Exception as e:
+                log.warning("Report to %s failed: %s", LOG_CHANNEL, e)
             await asyncio.sleep(POST_DELAY)
         except Exception as e:
             # stop here; next run retries from the same point
