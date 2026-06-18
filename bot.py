@@ -629,12 +629,17 @@ async def run():
             except Exception as e:
                 log.warning("Report to %s failed: %s", LOG_CHANNEL, e)
             await asyncio.sleep(POST_DELAY)
+        except FloodWaitError as e:
+            # Telegram is throttling the account. This is TEMPORARY, so we must not
+            # treat it as a bad post: stop the run and resume next time. Nothing lost.
+            log.warning("FloodWait reached; stopping run, will resume next trigger (%s).", e)
+            break
         except Exception as e:
             post_id = max(x.id for x in grp)
             n = _FAILS.get(str(post_id), 0) + 1
             _FAILS[str(post_id)] = n
             if n >= MAX_ATTEMPTS:
-                # one bad post must never block the channel forever -> skip past it
+                # one genuinely bad post must never block the channel forever -> skip it
                 log.error("Skipping post id=%s after %d failed attempts: %s", post_id, n, e)
                 write_state(post_id)
                 _FAILS.pop(str(post_id), None)
