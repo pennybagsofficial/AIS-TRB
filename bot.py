@@ -110,6 +110,14 @@ RUN_BUDGET = int(os.environ.get("RUN_BUDGET", "240"))   # seconds per run
 MAX_FLOOD = int(os.environ.get("MAX_FLOOD", "90"))      # if FloodWait longer, stop & resume next run
 POST_DELAY = float(os.environ.get("POST_DELAY", "1"))   # gap between posts
 
+# Telegram limits (UTF-16 code units): media caption 1024, message text 4096.
+CAPTION_LIMIT = int(os.environ.get("CAPTION_LIMIT", "1024"))
+TEXT_LIMIT = int(os.environ.get("TEXT_LIMIT", "4096"))
+# A post that keeps failing is skipped after this many attempts, so one bad post
+# can never permanently block the channel.
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
+FAILS_FILE = pathlib.Path(os.environ.get("FAILS_FILE", "state/failures.json"))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("radiobulletin")
 
@@ -172,6 +180,24 @@ def save_cooldowns():
 
 
 _COOLDOWNS = _load_cooldowns()
+
+
+def _load_fails() -> dict:
+    try:
+        return json.loads(FAILS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_fails():
+    try:
+        FAILS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        FAILS_FILE.write_text(json.dumps(_FAILS, sort_keys=True))
+    except Exception as e:
+        log.warning("Could not save failure counts: %s", e)
+
+
+_FAILS = _load_fails()
 
 
 def _retry_after(e) -> int:
@@ -401,16 +427,44 @@ async def _send_file(client, target, file, caption):
             await asyncio.sleep(e.seconds + 1)
 
 
-async def _send_text(client, target, text):
+async def _send_text(client, target, text, reply_to=None):
     while True:
         try:
-            return await client.send_message(target, text, link_preview=False)
+            return await client.send_message(target, text, link_preview=False, reply_to=reply_to)
         except FloodWaitError as e:
             if e.seconds > MAX_FLOOD:
                 log.warning("FloodWait %ss exceeds cap; stopping run, will resume next trigger.", e.seconds)
                 raise
             log.warning("FloodWait: sleeping %ss", e.seconds)
             await asyncio.sleep(e.seconds + 1)
+
+
+def _tg_len(s: str) -> int:
+    """Telegram counts message/caption length in UTF-16 code units, ignoring the
+    HTML tags (they become entities). This measures the visible length the same way."""
+    plain = re.sub(r"<[^>]+>", "", s or "")
+    return len(plain.encode("utf-16-le")) // 2
+
+
+def _split_plain(text: str, limit: int):
+    """Split plain text into <=limit (UTF-16) chunks at line/space boundaries."""
+    chunks, buf = [], ""
+    for line in (text or "").split("\n"):
+        piece = (buf + "\n" + line) if buf else line
+        if len(piece.encode("utf-16-le")) // 2 <= limit:
+            buf = piece
+        else:
+            if buf:
+                chunks.append(buf)
+            # a single very long line: hard-cut by characters
+            while len(line.encode("utf-16-le")) // 2 > limit:
+                cut = line[:limit]
+                chunks.append(cut)
+                line = line[limit:]
+            buf = line
+    if buf:
+        chunks.append(buf)
+    return chunks or [""]
 
 
 def media_kind(m) -> str:
@@ -428,35 +482,68 @@ def media_kind(m) -> str:
     return "other"
 
 
-async def post_group(client, target, group, caption):
-    """Post one post: a single message or an album, keeping ALL media.
-    If watermarking is enabled, every photo/video is stamped first.
-    Returns the sent message (or list of messages for an album)."""
-    media_msgs = [m for m in group if m.media]
-    if not media_msgs:
-        return await _send_text(client, target, caption)
+async def _send_long_text(client, target, html_text, reply_to=None):
+    """Send text that may exceed the 4096 limit. Keeps HTML formatting when it fits
+    in one message; for longer text falls back to plain split (formatting lost only
+    in that rare case)."""
+    if _tg_len(html_text) <= TEXT_LIMIT:
+        return await _send_text(client, target, html_text, reply_to=reply_to)
+    plain = re.sub(r"<[^>]+>", "", html_text)
+    first = None
+    for chunk in _split_plain(plain, TEXT_LIMIT):
+        m = await _send_text(client, target, html_lib.escape(chunk), reply_to=reply_to)
+        first = first or m
+    return first
 
-    # Fast path: no watermark -> re-use media already on Telegram servers.
+
+async def post_group(client, target, group, caption):
+    """Post one post (single message or album), keeping ALL media. If watermarking
+    is on, every photo/video is stamped first. If the caption is longer than the
+    media caption limit, the media goes out first and the full text follows as a
+    reply (so nothing is lost). Returns the primary sent message."""
+    media_msgs = [m for m in group if m.media]
+
+    # Text-only post
+    if not media_msgs:
+        return await _send_long_text(client, target, caption)
+
+    # Resolve the media to send (re-use, or download + watermark)
+    files = None
+    tmpdir = None
     if not watermark.available():
         try:
-            files = [m.media for m in media_msgs]
-            return await _send_file(client, target, files if len(files) > 1 else files[0], caption)
+            raw = [m.media for m in media_msgs]
+            files = raw if len(raw) > 1 else raw[0]
         except Exception as e:
-            log.warning("Direct media re-send failed (%s); downloading then re-uploading.", e)
-
-    # Download -> (watermark) -> re-upload. Used when watermarking, or as fallback.
-    with tempfile.TemporaryDirectory() as tmp:
+            log.warning("Direct media re-send prep failed (%s); will download.", e)
+    if files is None:
+        tmpdir = tempfile.TemporaryDirectory()
         paths = []
         for m in media_msgs:
-            p = await m.download_media(file=tmp + "/")
+            p = await m.download_media(file=tmpdir.name + "/")
             if not p:
                 continue
             if watermark.available():
                 p = watermark.apply(p, media_kind(m))
             paths.append(p)
         if not paths:
-            return await _send_text(client, target, caption)
-        return await _send_file(client, target, paths if len(paths) > 1 else paths[0], caption)
+            tmpdir.cleanup()
+            return await _send_long_text(client, target, caption)
+        files = paths if len(paths) > 1 else paths[0]
+
+    try:
+        if _tg_len(caption) <= CAPTION_LIMIT:
+            sent = await _send_file(client, target, files, caption)
+        else:
+            # caption too long for a media caption: send media first, then the
+            # full text as a reply so nothing is lost.
+            sent = await _send_file(client, target, files, None)
+            primary = sent[0] if isinstance(sent, (list, tuple)) and sent else sent
+            await _send_long_text(client, target, caption, reply_to=getattr(primary, "id", None))
+    finally:
+        if tmpdir:
+            tmpdir.cleanup()
+    return sent
 
 
 # --------------------------------------------------------------------------- #
@@ -534,6 +621,7 @@ async def run():
             # checkpoint AFTER success -> nothing lost, nothing duplicated
             post_id = max(x.id for x in grp)
             write_state(post_id)
+            _FAILS.pop(str(post_id), None)   # clear any prior failure count
             log.info("Mirrored post id=%s (%d media) via %s.",
                      post_id, sum(1 for x in grp if x.media), model_used or "—")
             try:
@@ -542,12 +630,21 @@ async def run():
                 log.warning("Report to %s failed: %s", LOG_CHANNEL, e)
             await asyncio.sleep(POST_DELAY)
         except Exception as e:
-            # stop here; next run retries from the same point
-            log.error("Failed on post id=%s: %s -- will retry next run.",
-                      max(x.id for x in grp), e)
+            post_id = max(x.id for x in grp)
+            n = _FAILS.get(str(post_id), 0) + 1
+            _FAILS[str(post_id)] = n
+            if n >= MAX_ATTEMPTS:
+                # one bad post must never block the channel forever -> skip past it
+                log.error("Skipping post id=%s after %d failed attempts: %s", post_id, n, e)
+                write_state(post_id)
+                _FAILS.pop(str(post_id), None)
+                continue
+            log.error("Failed on post id=%s (attempt %d/%d): %s -- will retry next run.",
+                      post_id, n, MAX_ATTEMPTS, e)
             break
 
     save_cooldowns()   # remember which models are rate-limited for the next run
+    save_fails()       # remember failing posts (for the skip-after-N safeguard)
     await client.disconnect()
 
 
