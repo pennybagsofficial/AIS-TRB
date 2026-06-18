@@ -56,7 +56,7 @@ jobs:
           WATERMARK: ${{ vars.WATERMARK }}
           LOGO_PATH: "watermark/logo.png"
           WM_POSITION: "center"
-          WM_SCALE: "0.15"                # logo width as a fraction of the media DIAGONAL
+          WM_SCALE: "0.16"                # logo width as a fraction of the media WIDTH
           WM_OPACITY: "0.85"
           # Either a fine-grained PAT with `models: read` as GH_MODELS_TOKEN,
           # or rely on the built-in token (works thanks to `models: read` above).
