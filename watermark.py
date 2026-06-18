@@ -80,6 +80,35 @@ def _wm_image(in_path: str) -> str:
     return out
 
 
+def _probe_display_size(path: str):
+    """Return the video's DISPLAY (square-pixel) width,height as even integers."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,sample_aspect_ratio",
+         "-of", "default=noprint_wrappers=1:nokey=0", path],
+        check=True, capture_output=True, text=True).stdout
+    w = h = 0
+    sar = "1:1"
+    for line in out.splitlines():
+        k, _, v = line.partition("=")
+        if k == "width":
+            w = int(v)
+        elif k == "height":
+            h = int(v)
+        elif k == "sample_aspect_ratio":
+            sar = v.strip()
+    dw = w
+    try:
+        num, _, den = sar.partition(":")
+        num, den = int(num), int(den)
+        if num > 0 and den > 0:
+            dw = round(w * num / den)
+    except Exception:
+        dw = w
+    even = lambda n: max(2, (int(n) // 2) * 2)
+    return even(dw), even(h)
+
+
 def _wm_video(in_path: str) -> str:
     out = in_path + ".wm.mp4"
     overlay = {
@@ -90,17 +119,22 @@ def _wm_video(in_path: str) -> str:
         "bottom-right": f"W-w-{MARGIN}:H-h-{MARGIN}",
     }.get(POSITION, f"W-w-{MARGIN}:H-h-{MARGIN}")
 
-    # 1) Normalize the video to SQUARE pixels at its display size. This is the fix
-    #    for the "stretched / thin / wrong-shape" logo: some videos have non-1:1
-    #    pixels (SAR), which distorts anything overlaid on them. ih*dar = display width.
-    # 2) Scale the logo to a fraction of that width (clamped), aspect preserved.
-    # (commas inside expression functions are escaped with \\, for the filtergraph)
-    w_expr = f"min(max(main_w*{LOGO_SCALE}\\,{WM_MIN_W})\\,{WM_MAX_W})"
+    # Normalize the frame to square pixels (kills SAR stretching), then scale the
+    # LOGO to a fixed pixel width with height=-1, which preserves the logo's own
+    # aspect ratio exactly. No scale2ref -> the logo shape can never change.
+    try:
+        dw, dh = _probe_display_size(in_path)
+        base = f"[0:v]scale={dw}:{dh}:flags=lanczos,setsar=1[base];"
+        tw = _target_width(dw, dh)
+    except Exception as e:
+        log.warning("ffprobe failed (%s); using a fixed logo width.", e)
+        base = "[0:v]setsar=1[base];"
+        tw = max(WM_MIN_W, min(WM_MAX_W, 240))
+
     filt = (
-        f"[0:v]scale=trunc(ih*dar/2)*2:ih:flags=lanczos,setsar=1[base];"
-        f"[1:v]format=rgba,colorchannelmixer=aa={LOGO_OPACITY}[lg];"
-        f"[lg][base]scale2ref=w={w_expr}:h=ow*ih/iw[wm][b2];"
-        f"[b2][wm]overlay={overlay}"
+        f"{base}"
+        f"[1:v]format=rgba,colorchannelmixer=aa={LOGO_OPACITY},scale={tw}:-1[wm];"
+        f"[base][wm]overlay={overlay}"
     )
     subprocess.run(
         ["ffmpeg", "-y", "-i", in_path, "-i", LOGO_PATH,
