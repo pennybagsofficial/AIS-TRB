@@ -21,6 +21,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Always read the LATEST saved state from main, even on a re-run of an old
+      # run, so the bot never re-processes (and re-posts) old messages.
+      - name: Sync latest state
+        run: |
+          git fetch origin main --depth=1 || true
+          git checkout origin/main -- state 2>/dev/null || true
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -64,9 +71,25 @@ jobs:
         run: python bot.py
 
       - name: Save progress
+        if: always()   # save even if a post failed, so the checkpoint isn't lost
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A state || true
-          git diff --cached --quiet || git commit -m "update state [skip ci]"
-          git push
+          if git diff --cached --quiet; then echo "no state changes"; exit 0; fi
+          git commit -m "update state [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git push origin HEAD:main; then echo "state pushed"; exit 0; fi
+            echo "push rejected; reconciling with remote (attempt $i)"
+            ours=$(cat state/last_id.txt 2>/dev/null || echo 0)
+            git fetch origin main || true
+            git reset --hard origin/main
+            theirs=$(cat state/last_id.txt 2>/dev/null || echo 0)
+            max=$ours; [ "$theirs" -gt "$ours" ] 2>/dev/null && max=$theirs
+            echo "$max" > state/last_id.txt
+            git add -A state || true
+            if git diff --cached --quiet; then echo "remote already current"; exit 0; fi
+            git commit -m "update state [skip ci]"
+          done
+          echo "Could not push state after retries; next run will reconcile."
+          exit 0   # never fail the whole job just because of a state push race
