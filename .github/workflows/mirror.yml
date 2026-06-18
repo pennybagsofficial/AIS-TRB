@@ -41,17 +41,22 @@ jobs:
           SOURCE_USERNAME: ${{ vars.SOURCE_USERNAME }}
           TARGET_HANDLE: "@RadioBulletin"
           FOOTER: "@RadioBulletin | رادیو بولتن"
+          LOG_CHANNEL: "@AnalyzeAistrb"     # per-post analytics report channel ("" to disable)
+          REPORT_TZ: "Asia/Tehran"          # timezone used in the report timestamp
           TRANSLATOR: "github"
-          # AI model fallback chain (best Persian first). If one hits its limit,
-          # the bot switches to the next; Google is only the last resort.
-          MODELS: "openai/gpt-4.1,openai/gpt-4o,openai/gpt-4.1-mini,openai/gpt-4o-mini"
+          # Translation fallback chain, best Persian first. Format: backend:model
+          #   github:<id>  -> GitHub Models (needs GH_MODELS_TOKEN)
+          #   gemini:<id>  -> Google Gemini (needs GEMINI_API_KEY); big daily quota
+          #   google:translate -> free Google Translate, plain-text final safety net
+          # A wrong/retired/limited entry is skipped automatically.
+          CHAIN: "github:openai/gpt-4.1,github:openai/gpt-4o,gemini:gemini-2.5-flash,github:openai/gpt-4.1-mini,github:openai/gpt-4o-mini,github:deepseek/DeepSeek-V3-0324,github:meta/Llama-3.3-70B-Instruct,github:mistral-ai/Mistral-Large-2411,google:translate"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RUN_BUDGET: "600"               # 10 min cap per run (keep BELOW your trigger interval)
           # Watermark: set the variable WATERMARK=on and add watermark/logo.png to enable.
           WATERMARK: ${{ vars.WATERMARK }}
           LOGO_PATH: "watermark/logo.png"
           WM_POSITION: "center"
           WM_SCALE: "0.15"                # logo width as a fraction of the media DIAGONAL
-          WM_SCALE: "0.18"
           WM_OPACITY: "0.85"
           # Either a fine-grained PAT with `models: read` as GH_MODELS_TOKEN,
           # or rely on the built-in token (works thanks to `models: read` above).
