@@ -21,10 +21,19 @@ log = logging.getLogger("radiobulletin.watermark")
 
 ENABLED = os.environ.get("WATERMARK", "off").lower() in ("on", "1", "true", "yes")
 LOGO_PATH = os.environ.get("LOGO_PATH", "watermark/logo.png")
-POSITION = os.environ.get("WM_POSITION", "bottom-right").lower()  # 4 corners
-LOGO_SCALE = float(os.environ.get("WM_SCALE", "0.18"))            # 18% of media width
-LOGO_OPACITY = float(os.environ.get("WM_OPACITY", "0.85"))        # 0..1
+POSITION = os.environ.get("WM_POSITION", "bottom-right").lower()  # 4 corners or center
+LOGO_SCALE = float(os.environ.get("WM_SCALE", "0.15"))           # fraction of the media DIAGONAL
+WM_MIN_W = int(os.environ.get("WM_MIN_W", "70"))                 # min logo width in px
+WM_MAX_W = int(os.environ.get("WM_MAX_W", "700"))               # max logo width in px
+LOGO_OPACITY = float(os.environ.get("WM_OPACITY", "0.85"))       # 0..1
 MARGIN = int(os.environ.get("WM_MARGIN", "24"))                   # px from the edge
+
+
+def _target_width(media_w: int, media_h: int) -> int:
+    """Logo width based on the media DIAGONAL, so it looks the same size on
+    landscape, portrait and square media. Clamped so it's never absurd."""
+    diag = (media_w ** 2 + media_h ** 2) ** 0.5
+    return int(round(max(WM_MIN_W, min(LOGO_SCALE * diag, WM_MAX_W))))
 
 
 def available() -> bool:
@@ -56,7 +65,7 @@ def _wm_image(in_path: str) -> str:
     base = Image.open(in_path).convert("RGBA")
     logo = Image.open(LOGO_PATH).convert("RGBA")
 
-    target_w = max(1, int(base.width * LOGO_SCALE))
+    target_w = _target_width(base.width, base.height)
     ratio = target_w / logo.width
     logo = logo.resize((target_w, max(1, int(logo.height * ratio))))
 
@@ -82,9 +91,12 @@ def _wm_video(in_path: str) -> str:
         "bottom-right": f"W-w-{MARGIN}:H-h-{MARGIN}",
     }.get(POSITION, f"W-w-{MARGIN}:H-h-{MARGIN}")
 
+    # Logo width = fraction of the video diagonal, clamped, height keeps logo aspect.
+    # (commas inside the expression functions are escaped with \\, for the filtergraph)
+    w_expr = (f"min(max(hypot(main_w\\,main_h)*{LOGO_SCALE}\\,{WM_MIN_W})\\,{WM_MAX_W})")
     filt = (
         f"[1:v]format=rgba,colorchannelmixer=aa={LOGO_OPACITY}[lg];"
-        f"[lg][0:v]scale2ref=w=main_w*{LOGO_SCALE}:h=ow/mdar[wm][base];"
+        f"[lg][0:v]scale2ref=w={w_expr}:h=ow*ih/iw[wm][base];"
         f"[base][wm]overlay={overlay}"
     )
     subprocess.run(
