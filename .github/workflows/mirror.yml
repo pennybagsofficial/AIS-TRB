@@ -63,7 +63,7 @@ jobs:
           #   gemini:<id>  -> Google Gemini (needs GEMINI_API_KEY); big daily quota
           #   google:translate -> free Google Translate, plain-text final safety net
           # A wrong/retired/limited entry is skipped automatically.
-          CHAIN: "github:openai/gpt-4.1,github:openai/gpt-4o,gemini:gemini-2.5-flash,github:openai/gpt-4.1-mini,github:openai/gpt-4o-mini,github:deepseek/DeepSeek-V3-0324,github:meta/Llama-3.3-70B-Instruct,github:mistral-ai/Mistral-Large-2411,google:translate"
+          CHAIN: "gemini:gemini-3-flash-preview,github:openai/gpt-4.1,github:openai/gpt-4o,gemini:gemini-2.5-flash,github:openai/gpt-4.1-mini,github:openai/gpt-4o-mini,google:translate"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           RUN_BUDGET: "600"               # 10 min cap per run (keep BELOW your trigger interval)
           # Watermark: set the variable WATERMARK=on and add watermark/logo.png to enable.
