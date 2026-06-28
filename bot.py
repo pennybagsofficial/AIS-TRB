@@ -71,14 +71,12 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 # model id is wrong/retired the bot just skips it. Non-OpenAI ids can be copied
 # from https://github.com/marketplace/models
 _DEFAULT_CHAIN = (
+    "gemini:gemini-3-flash-preview,"
     "github:openai/gpt-4.1,"
     "github:openai/gpt-4o,"
     "gemini:gemini-2.5-flash,"
     "github:openai/gpt-4.1-mini,"
     "github:openai/gpt-4o-mini,"
-    "github:deepseek/DeepSeek-V3-0324,"
-    "github:meta/Llama-3.3-70B-Instruct,"
-    "github:mistral-ai/Mistral-Large-2411,"
     "google:translate"
 )
 
